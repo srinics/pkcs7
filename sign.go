@@ -16,6 +16,61 @@ import (
 	"time"
 )
 
+// OID for MGF1 mask generation function (RFC 4055 §3.1)
+var oidMGF1 = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 8}
+
+// rsaPSSAlgorithmParameters returns the DER-encoded RSASSA-PSS-params asn1.RawValue
+// required in the AlgorithmIdentifier.Parameters field of digestEncryptionAlgorithm
+// when the signature algorithm is id-RSASSA-PSS (RFC 4055 §3.1 and §3.3).
+// Supported hash algorithms: SHA-256, SHA-384, SHA-512.
+func rsaPSSAlgorithmParameters(hash crypto.Hash) (asn1.RawValue, error) {
+	var hashOID asn1.ObjectIdentifier
+	var saltLen int
+	switch hash {
+	case crypto.SHA256:
+		hashOID = OIDDigestAlgorithmSHA256
+		saltLen = 32
+	case crypto.SHA384:
+		hashOID = OIDDigestAlgorithmSHA384
+		saltLen = 48
+	case crypto.SHA512:
+		hashOID = OIDDigestAlgorithmSHA512
+		saltLen = 64
+	default:
+		return asn1.RawValue{}, fmt.Errorf("pkcs7: unsupported PSS hash algorithm: %v", hash)
+	}
+
+	hashAlgID := pkix.AlgorithmIdentifier{Algorithm: hashOID}
+	hashAlgBytes, err := asn1.Marshal(hashAlgID)
+	if err != nil {
+		return asn1.RawValue{}, err
+	}
+
+	// RSASSA-PSS-params ::= SEQUENCE {
+	//   hashAlgorithm     [0] EXPLICIT HashAlgorithm,
+	//   maskGenAlgorithm  [1] EXPLICIT MaskGenAlgorithm,
+	//   saltLength        [2] INTEGER
+	// }
+	pssParams := struct {
+		HashAlgorithm    pkix.AlgorithmIdentifier `asn1:"explicit,tag:0"`
+		MaskGenAlgorithm pkix.AlgorithmIdentifier `asn1:"explicit,tag:1"`
+		SaltLength       int                      `asn1:"explicit,tag:2"`
+	}{
+		HashAlgorithm: hashAlgID,
+		MaskGenAlgorithm: pkix.AlgorithmIdentifier{
+			Algorithm:  oidMGF1,
+			Parameters: asn1.RawValue{FullBytes: hashAlgBytes},
+		},
+		SaltLength: saltLen,
+	}
+
+	b, err := asn1.Marshal(pssParams)
+	if err != nil {
+		return asn1.RawValue{}, err
+	}
+	return asn1.RawValue{FullBytes: b}, nil
+}
+
 // SignedData is an opaque data structure for creating signed data payloads
 type SignedData struct {
 	sd                  signedData
@@ -165,8 +220,13 @@ func (sd *SignedData) AddSignerChain(ee *x509.Certificate, keyOrSigner interface
 		return err
 	}
 	// Override to id-RSASSA-PSS when PSS options are explicitly provided.
-	if _, isPSS := config.SignerOpts.(*rsa.PSSOptions); isPSS {
+	var pssParams asn1.RawValue
+	if pssOpts, isPSS := config.SignerOpts.(*rsa.PSSOptions); isPSS {
 		encryptionOid = OIDEncryptionAlgorithmRSAPSS
+		pssParams, err = rsaPSSAlgorithmParameters(pssOpts.Hash)
+		if err != nil {
+			return err
+		}
 	}
 	attrs := &attributes{}
 	attrs.Add(OIDAttributeContentType, sd.sd.ContentInfo.ContentType)
@@ -196,7 +256,7 @@ func (sd *SignedData) AddSignerChain(ee *x509.Certificate, keyOrSigner interface
 		AuthenticatedAttributes:   finalAttrs,
 		UnauthenticatedAttributes: finalUnsignedAttrs,
 		DigestAlgorithm:           pkix.AlgorithmIdentifier{Algorithm: sd.digestOid},
-		DigestEncryptionAlgorithm: pkix.AlgorithmIdentifier{Algorithm: encryptionOid},
+		DigestEncryptionAlgorithm: pkix.AlgorithmIdentifier{Algorithm: encryptionOid, Parameters: pssParams},
 		IssuerAndSerialNumber:     ias,
 		EncryptedDigest:           signature,
 		Version:                   1,
