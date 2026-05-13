@@ -6,6 +6,7 @@ import (
 	"crypto/dsa"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
@@ -48,6 +49,9 @@ type SignerInfoConfig struct {
 	ExtraSignedAttributes   []Attribute
 	ExtraUnsignedAttributes []Attribute
 	SkipCertificates        bool
+	// SignerOpts controls the signing options passed to crypto.Signer.Sign.
+	// Set to *rsa.PSSOptions to use RSA-PSS instead of PKCS1v15.
+	SignerOpts crypto.SignerOpts
 }
 
 type signedData struct {
@@ -160,6 +164,10 @@ func (sd *SignedData) AddSignerChain(ee *x509.Certificate, keyOrSigner interface
 	if err != nil {
 		return err
 	}
+	// Override to id-RSASSA-PSS when PSS options are explicitly provided.
+	if _, isPSS := config.SignerOpts.(*rsa.PSSOptions); isPSS {
+		encryptionOid = OIDEncryptionAlgorithmRSAPSS
+	}
 	attrs := &attributes{}
 	attrs.Add(OIDAttributeContentType, sd.sd.ContentInfo.ContentType)
 	attrs.Add(OIDAttributeMessageDigest, sd.messageDigest)
@@ -180,7 +188,7 @@ func (sd *SignedData) AddSignerChain(ee *x509.Certificate, keyOrSigner interface
 		return err
 	}
 	// create signature of signed attributes
-	signature, err := signAttributes(finalAttrs, keyOrSigner, hash)
+	signature, err := signAttributes(finalAttrs, keyOrSigner, hash, config.SignerOpts)
 	if err != nil {
 		return err
 	}
@@ -371,8 +379,10 @@ func cert2issuerAndSerial(cert *x509.Certificate) issuerAndSerial {
 	return ias
 }
 
-// signs the DER encoded form of the attributes with the private key
-func signAttributes(attrs []attribute, keyOrSigner interface{}, digestAlg crypto.Hash) ([]byte, error) {
+// signs the DER encoded form of the attributes with the private key.
+// signerOpts, if non-nil, overrides the default crypto.Hash opts passed to
+// signer.Sign — use *rsa.PSSOptions to produce an RSA-PSS signature.
+func signAttributes(attrs []attribute, keyOrSigner interface{}, digestAlg crypto.Hash, signerOpts crypto.SignerOpts) ([]byte, error) {
 	attrBytes, err := marshalAttributes(attrs)
 	if err != nil {
 		return nil, err
@@ -403,7 +413,13 @@ func signAttributes(attrs []attribute, keyOrSigner interface{}, digestAlg crypto
 		return signer.Sign(rand.Reader, attrBytes, crypto.Hash(0))
 	}
 
-	return signer.Sign(rand.Reader, hash, digestAlg)
+	// Use caller-provided opts (e.g. *rsa.PSSOptions) when present,
+	// otherwise fall back to the digest algorithm hash.
+	opts := crypto.SignerOpts(digestAlg)
+	if signerOpts != nil {
+		opts = signerOpts
+	}
+	return signer.Sign(rand.Reader, hash, opts)
 }
 
 type dsaSignature struct {
